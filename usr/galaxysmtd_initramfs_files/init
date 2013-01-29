@@ -6,8 +6,13 @@ busybox cd /
 busybox date >>boot.txt
 exec >>boot.txt 2>&1
 busybox rm init
+busybox mknod /dev/block/loop0 b 7 0
 busybox mount -t proc proc /proc
 busybox mount -t sysfs sysfs /sys
+
+busybox mkdir /.secondrom
+busybox chmod 0050 /.secondrom
+busybox chown -R root.sdcard_rw /.secondrom
 
 for i in $(busybox seq 1 5) ; do
 if busybox test -d /sys/dev/block/179:0 ; then
@@ -19,20 +24,54 @@ busybox sleep 1
 fi
 done
 
-
 /lvm/sbin/lvm vgscan --mknodes --ignorelockingfailure
 /lvm/sbin/lvm vgchange -aly --ignorelockingfailure
 
-busybox mount -t ext4 /dev/lvpool/system /system
-busybox mount -t ext4 /dev/lvpool/userdata /data
 busybox mount -t yaffs2 /dev/block/mtdblock3 /cache
 
-image=/stage1/ramdisk.img
+busybox mv /cache/previous_boot.log /cache/old_boot.log
+busybox mv /cache/boot.log /cache/previous_boot.log
+busybox date >/cache/boot.log
+exec >>/cache/boot.log 2>&1
 
+####################################################################
+########## mount partitions depending on rom selection ###########
+####################################################################
+busybox mkdir -p /cache/dualboot
+if busybox test -f /cache/dualboot/rom ; then
+	if busybox grep -q primary /cache/dualboot/rom ; then # primary/normal boot
+		SYSTEM=/dev/lvpool/system
+		busybox mount -t ext4 /dev/lvpool/userdata /data
+	elif busybox grep -q secondary /cache/dualboot/rom ; then # boot secondary rom
+		SYSTEM=/dev/lvpool/secondary_system
+		#busybox mount -t vfat /dev/block/mmcblk0p1 /.secondrom
+		#busybox chmod 0777 /.secondrom
+  		#busybox mount -t ext4 /.secondrom/.secondrom/data.img /data
+		busybox mount -t ext4 /dev/lvpool/userdata /data
+	fi
+		busybox mount -t ext4 $SYSTEM /system
+else
+		busybox mkdir -p /cache/dualboot
+		busybox touch /cache/dualboot/rom
+		busybox echo "emergency" > /cache/dualboot/rom
+		echo "no rom selected..."
+		echo "booting to recovery"
+fi
+
+busybox echo "currently mounted:"
+busybox mount
+
+#####################################################################	
+
+image=/stage1/ramdisk.img
+bootmode=system
+
+busybox echo ""
 busybox echo "starting bootmode detection..."
 busybox echo "command line:"
 busybox cat /proc/cmdline
 if busybox test -e /cache/.startrecovery ||
+	busybox grep -q emergency /cache/dualboot/rom ||
 	busybox grep -q bootmode=2 /proc/cmdline || # normal mode
 	busybox grep -q bootmode=5 /proc/cmdline || # xl mem
 	busybox grep -q bootmode=9 /proc/cmdline || # big mem
@@ -42,18 +81,20 @@ if busybox test -e /cache/.startrecovery ||
 
 	busybox rm -fr /cache/.startrecovery
 	image=/stage1/ramdisk-recovery.img
+	bootmode=recovery
 
 	# disable lpm
 	busybox echo 0 > /sys/class/power_supply/battery/charging_mode_booting
 elif ! busybox test -e /system/build.prop ; then
 	# emergency boot
-	busybox umount /cache
-	erase_image cache
+	busybox echo "no build.prop found...booting to recovery"
+	busybox umount -f /system
+	busybox umount -f /.secondrom
+	busybox mount -t vfat /dev/block/mmcblk0p1 /sdcard
 	busybox mount -t yaffs2 /dev/block/mtdblock3 /cache
-	busybox mkdir /cache/recovery
-
-	busybox mount -t vfat /dev/block/mmcblk0p1 /sdcard	
-
+	busybox rm -rf /cache/recovery
+	busybox mkdir -p /cache/recovery
+	
 	UPDATE=$(busybox cat /sdcard/cyanogenmod.cfg)
 
 	if busybox test -n "$UPDATE" && busybox test -e $UPDATE ; then
@@ -61,16 +102,32 @@ elif ! busybox test -e /system/build.prop ; then
 	fi
 
 	image=/stage1/ramdisk-recovery.img
+	bootmode=recovery
 
 	# disable lpm
 	busybox echo 0 > /sys/class/power_supply/battery/charging_mode_booting
 fi
 
-busybox umount /cache
-busybox umount /sdcard
-busybox rmdir /sdcard
-
 busybox zcat $image | busybox cpio -i
+
+	if busybox [ "$bootmode" = "system" ] ; then
+		if busybox grep -q secondary /cache/dualboot/rom ; then
+			busybox mv fstab.aries.secondary fstab.aries
+			busybox mv init.aries.rc2 init.aries.rc
+		else 
+			busybox mv fstab.aries.primary fstab.aries
+		fi
+	busybox umount -f /.secondrom
+	elif busybox [ "$bootmode" = "recovery" ] ; then
+		busybox mount -t yaffs2 /dev/block/mtdblock3 /cache
+			if busybox grep -q secondary /cache/dualboot/unsecure ; then
+				busybox mv etc/recovery.fstab.secondary etc/recovery.fstab
+				busybox mount -t vfat /dev/block/mmcblk0p1 /.secondrom
+			elif busybox grep -q primary /cache/dualboot/unsecure ; then
+				busybox mv etc/recovery.fstab.primary etc/recovery.fstab
+			fi			
+			busybox rm -rf /cache/dualboot/unsecure
+	fi
 
 
 ################ apply bigmem at first boot ##################################################################
@@ -108,8 +165,15 @@ bigmem=0
     		busybox echo "copying cm default libs"
     			busybox cp default_libs/*.so /system/lib/
 	fi
-busybox umount /system
-busybox umount /data
+
+busybox umount -f /cache
+busybox umount -f /system
+busybox umount -f /data
+busybox umount -f /sdcard
+busybox rmdir /sdcard
+
+busybox echo "currently still mounted:"
+busybox mount
 
 if busybox grep -q 1 /sys/class/power_supply/battery/charging_mode_booting ; then
 	# low power mode

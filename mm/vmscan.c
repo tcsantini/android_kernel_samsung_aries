@@ -37,6 +37,7 @@
 #include <linux/rwsem.h>
 #include <linux/delay.h>
 #include <linux/kthread.h>
+#include <linux/timer.h>
 #include <linux/freezer.h>
 #include <linux/memcontrol.h>
 #include <linux/delayacct.h>
@@ -624,6 +625,8 @@ void putback_lru_page(struct page *page)
 	int was_unevictable = PageUnevictable(page);
 
 	VM_BUG_ON(PageLRU(page));
+  	if (active)
+    		SetPageWasActive(page);
 
 redo:
 	ClearPageUnevictable(page);
@@ -766,7 +769,10 @@ static noinline_for_stack void free_page_list(struct list_head *free_pages)
 /*
  * shrink_page_list() returns the number of reclaimed pages
  */
-static unsigned long shrink_page_list(struct list_head *page_list,
+#ifndef CONFIG_ZRAM_FOR_ANDROID
+static
+#endif /* CONFIG_ZRAM_FOR_ANDROID */
+unsigned long shrink_page_list(struct list_head *page_list,
 				      struct zone *zone,
 				      struct scan_control *sc)
 {
@@ -981,7 +987,7 @@ cull_mlocked:
 
 activate_locked:
 		/* Not a candidate for swapping, so reclaim swap space. */
-		if (PageSwapCache(page) && vm_swap_full())
+		if (PageSwapCache(page))
 			try_to_free_swap(page);
 		VM_BUG_ON(PageActive(page));
 		SetPageActive(page);
@@ -1268,7 +1274,10 @@ static unsigned long isolate_pages_global(unsigned long nr,
  * clear_active_flags() is a helper for shrink_active_list(), clearing
  * any active bits from the pages in the list.
  */
-static unsigned long clear_active_flags(struct list_head *page_list,
+#ifndef CONFIG_ZRAM_FOR_ANDROID
+static
+#endif /* CONFIG_ZRAM_FOR_ANDROID */
+unsigned long clear_active_flags(struct list_head *page_list,
 					unsigned int *count)
 {
 	int nr_active = 0;
@@ -1281,6 +1290,7 @@ static unsigned long clear_active_flags(struct list_head *page_list,
 		if (PageActive(page)) {
 			lru += LRU_ACTIVE;
 			ClearPageActive(page);
+			SetPageWasActive(page);
 			nr_active += numpages;
 		}
 		if (count)
@@ -1337,6 +1347,40 @@ int isolate_lru_page(struct page *page)
 	}
 	return ret;
 }
+
+#ifdef CONFIG_ZRAM_FOR_ANDROID
+/**
+ * isolate_lru_page_compcache - tries to isolate a page for compcache
+ * @page: page to isolate from its LRU list
+ *
+ * Isolates a @page from an LRU list, clears PageLRU,but
+ * does not adjusts the vmstat statistic
+ * Returns 0 if the page was removed from an LRU list.
+ * Returns -EBUSY if the page was not on an LRU list.
+ */
+int isolate_lru_page_compcache(struct page *page)
+{
+	int ret = -EBUSY;
+
+	VM_BUG_ON(!page_count(page));
+
+	if (PageLRU(page)) {
+		struct zone *zone = page_zone(page);
+
+		spin_lock_irq(&zone->lru_lock);
+		if (PageLRU(page)) {
+			int lru = page_lru(page);
+			ret = 0;
+			get_page(page);
+			ClearPageLRU(page);
+			list_del(&page->lru);
+			mem_cgroup_del_lru_list(page, lru);
+		}
+		spin_unlock_irq(&zone->lru_lock);
+	}
+	return ret;
+}
+#endif
 
 /*
  * Are there way too many processes in the direct reclaim path already?
@@ -1574,6 +1618,44 @@ shrink_inactive_list(unsigned long nr_to_scan, struct zone *zone,
 	return nr_reclaimed;
 }
 
+#ifdef CONFIG_ZRAM_FOR_ANDROID
+unsigned long
+zone_id_shrink_pagelist(struct zone *zone, struct list_head *page_list)
+{
+	unsigned long nr_reclaimed = 0;
+	unsigned long nr_anon;
+	unsigned long nr_file;
+
+	struct scan_control sc = {
+		.gfp_mask = GFP_USER,
+		.may_writepage = 1,
+		.nr_to_reclaim = SWAP_CLUSTER_MAX,
+		.may_unmap = 1,
+		.may_swap = 1,
+		.swappiness = vm_swappiness,
+		.order = 0,
+		.mem_cgroup = NULL,
+		.nodemask = NULL,
+	};
+
+	spin_lock_irq(&zone->lru_lock);
+
+	update_isolated_counts(zone, &sc, &nr_anon, &nr_file, page_list);
+
+	spin_unlock_irq(&zone->lru_lock);
+
+	nr_reclaimed = shrink_page_list(page_list, zone, &sc);
+
+	__count_zone_vm_events(PGSTEAL, zone, nr_reclaimed);
+
+	putback_lru_pages(zone, &sc, nr_anon, nr_file, page_list);
+
+	return nr_reclaimed;
+}
+
+EXPORT_SYMBOL(zone_id_shrink_pagelist);
+#endif /* CONFIG_ZRAM_FOR_ANDROID */
+
 /*
  * This moves pages from the active list to the inactive list.
  *
@@ -1702,6 +1784,7 @@ static void shrink_active_list(unsigned long nr_pages, struct zone *zone,
 		}
 
 		ClearPageActive(page);	/* we are de-activating */
+		SetPageWasActive(page);
 		list_add(&page->lru, &l_inactive);
 	}
 
@@ -2120,6 +2203,33 @@ static inline bool compaction_ready(struct zone *zone, struct scan_control *sc)
 		return false;
 
 	return watermark_ok;
+}
+
+/*
+ * Helper functions to adjust nice level of kswapd, based on the priority of
+ * the task (p) that called it. If it is already higher priority we do not
+ * demote its nice level since it is still working on behalf of a higher
+ * priority task. With kernel threads we leave it at nice 0.
+ *
+ * We don't ever run kswapd real time, so if a real time task calls kswapd we
+ * set it to highest SCHED_NORMAL priority.
+ */
+static inline int effective_sc_prio(struct task_struct *p)
+{
+	if (likely(p->mm)) {
+		if (rt_task(p))
+			return -20;
+		return task_nice(p);
+	}
+	return 0;
+}
+
+static void set_kswapd_nice(struct task_struct *kswapd, int active)
+{
+	long nice = effective_sc_prio(current);
+
+	if (task_nice(kswapd) > nice || !active)
+		set_user_nice(kswapd, nice);
 }
 
 /*
@@ -2876,6 +2986,8 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int order, int classzone_idx)
 	finish_wait(&pgdat->kswapd_wait, &wait);
 }
 
+#define WT_EXPIRY	(HZ * 5)	/* Time to wakeup watermark_timer */
+
 /*
  * The background pageout daemon, started as a kernel thread
  * from the init process.
@@ -2930,6 +3042,9 @@ static int kswapd(void *p)
 	balanced_classzone_idx = classzone_idx;
 	for ( ; ; ) {
 		int ret;
+
+		/* kswapd has been busy so delay watermark_timer */
+		mod_timer(&pgdat->watermark_timer, jiffies + WT_EXPIRY);
 
 		/*
 		 * If the last balance_pgdat was unsuccessful it's unlikely a
@@ -2988,6 +3103,7 @@ static int kswapd(void *p)
 void wakeup_kswapd(struct zone *zone, int order, enum zone_type classzone_idx)
 {
 	pg_data_t *pgdat;
+	int active;
 
 	if (!populated_zone(zone))
 		return;
@@ -2999,7 +3115,9 @@ void wakeup_kswapd(struct zone *zone, int order, enum zone_type classzone_idx)
 		pgdat->kswapd_max_order = order;
 		pgdat->classzone_idx = min(pgdat->classzone_idx, classzone_idx);
 	}
-	if (!waitqueue_active(&pgdat->kswapd_wait))
+	active = waitqueue_active(&pgdat->kswapd_wait);
+	set_kswapd_nice(pgdat->kswapd, active);
+	if (!active)
 		return;
 	if (zone_watermark_ok_safe(zone, order, low_wmark_pages(zone), 0, 0))
 		return;
@@ -3112,20 +3230,57 @@ static int __devinit cpu_callback(struct notifier_block *nfb,
 }
 
 /*
+ * We wake up kswapd every WT_EXPIRY till free ram is above pages_lots
+ */
+static void watermark_wakeup(unsigned long data)
+{
+	pg_data_t *pgdat = (pg_data_t *)data;
+	struct timer_list *wt = &pgdat->watermark_timer;
+	int i;
+
+	if (!waitqueue_active(&pgdat->kswapd_wait))
+		goto out;
+	for (i = pgdat->nr_zones - 1; i >= 0; i--) {
+		struct zone *z = pgdat->node_zones + i;
+
+		if (!populated_zone(z) || is_highmem(z)) {
+			/* We are better off leaving highmem full */
+			continue;
+		}
+		if (!zone_watermark_ok(z, 0, lots_wmark_pages(z), 0, 0)) {
+			wake_up_interruptible(&pgdat->kswapd_wait);
+			goto out;
+		}
+	}
+out:
+	mod_timer(wt, jiffies + WT_EXPIRY);
+	return;
+}
+
+/*
  * This kswapd start function will be called by init and node-hot-add.
  * On node-hot-add, kswapd will moved to proper cpus if cpus are hot-added.
  */
 int kswapd_run(int nid)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
+	struct timer_list *wt;
 	int ret = 0;
 
 	if (pgdat->kswapd)
 		return 0;
 
+	wt = &pgdat->watermark_timer;
+	init_timer(wt);
+	wt->data = (unsigned long)pgdat;
+	wt->function = watermark_wakeup;
+	wt->expires = jiffies + WT_EXPIRY;
+	add_timer(wt);
+
 	pgdat->kswapd = kthread_run(kswapd, pgdat, "kswapd%d", nid);
 	if (IS_ERR(pgdat->kswapd)) {
 		/* failure at boot is fatal */
+		del_timer(wt);
 		BUG_ON(system_state == SYSTEM_BOOTING);
 		printk("Failed to start kswapd on node %d\n",nid);
 		ret = -1;

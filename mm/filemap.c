@@ -127,7 +127,7 @@ void __delete_from_page_cache(struct page *page)
 	if (PageUptodate(page) && PageMappedToDisk(page))
 		cleancache_put_page(page);
 	else
-		cleancache_flush_page(mapping, page);
+		cleancache_invalidate_page(mapping, page);
 
 	radix_tree_delete(&mapping->page_tree, page->index);
 	page->mapping = NULL;
@@ -484,8 +484,8 @@ out:
 }
 EXPORT_SYMBOL(add_to_page_cache_locked);
 
-int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
-				pgoff_t offset, gfp_t gfp_mask)
+int __add_to_page_cache_lru(struct page *page, struct address_space *mapping,
+				pgoff_t offset, gfp_t gfp_mask, int tail)
 {
 	int ret;
 
@@ -501,12 +501,19 @@ int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
 	ret = add_to_page_cache(page, mapping, offset, gfp_mask);
 	if (ret == 0) {
 		if (page_is_file_cache(page))
-			lru_cache_add_file(page);
+			lru_cache_add_file_tail(page, tail);
 		else
 			lru_cache_add_anon(page);
 	}
 	return ret;
 }
+
+int add_to_page_cache_lru(struct page *page, struct address_space *mapping,
+				pgoff_t offset, gfp_t gfp_mask)
+{
+	return __add_to_page_cache_lru(page, mapping, offset, gfp_mask, 0);
+}
+
 EXPORT_SYMBOL_GPL(add_to_page_cache_lru);
 
 #ifdef CONFIG_NUMA
