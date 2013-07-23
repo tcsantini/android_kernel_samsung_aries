@@ -9,6 +9,7 @@ busybox rm init
 busybox mount -t proc proc /proc
 busybox mount -t sysfs sysfs /sys
 
+<<<<<<< HEAD
 for i in $(busybox seq 1 5) ; do
 if busybox test -d /sys/dev/block/179:0 ; then
 break
@@ -17,6 +18,11 @@ echo "Waiting for internal mmc..."
 echo $i;
 busybox sleep 1
 fi
+=======
+while ! busybox test -d /sys/dev/block/179:0 ; do
+	echo "Waiting for internal mmc..."
+	busybox sleep 1
+>>>>>>> 5dd3308e81c660adaf95ff9d1efd699d0ad94b41
 done
 
 /lvm/sbin/lvm vgscan --mknodes --ignorelockingfailure
